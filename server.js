@@ -112,6 +112,11 @@ const server = http.createServer((req, res) => {
       try {
         const { status, message, recipientName, recipientBank, recipientImage } = JSON.parse(body || '{}');
         const job = jobs.get(id);
+        if (!job) {
+          res.writeHead(404, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, error: 'Job not found or expired' }));
+          return;
+        }
         if (job) {
           job.status = status || 'done';
           job.recipientName = recipientName || job.recipientName || null;
@@ -138,15 +143,8 @@ const server = http.createServer((req, res) => {
             });
           }
 
-          // ★ ลบเฉพาะ "รูป" (ส่วนที่กินพื้นที่ memory เยอะสุด) ออกก่อน หลังจากส่งให้ครบทุกช่องทางแล้ว
-          // (WS แบบ real-time + polling fallback ที่ BO เช็คทุก ~3 วิ) เก็บแค่ 15 วิให้ชัวร์ว่าถึงแน่ๆ
-          // ตัว job (ข้อความ/สถานะ) ยังอยู่ต่อจนครบ 5 นาทีตามเดิม เผื่อ query ย้อนหลัง
-          if (job.recipientImage) {
-            setTimeout(() => {
-              const j = jobs.get(id);
-              if (j) j.recipientImage = null;
-            }, 15000);
-          }
+          // Keep the image with the result until normal job cleanup (5 minutes).
+          // Background tabs may be throttled and poll later than 15 seconds.
 
           // ลบทั้ง job หลัง 5 นาที (job เสร็จแล้ว ไม่ต้องรอ scheduleExpiry อีก)
           setTimeout(() => jobs.delete(id), 300000);
@@ -172,11 +170,10 @@ const server = http.createServer((req, res) => {
     }
     res.writeHead(200, { 'Content-Type': 'application/json' });
     if (!latest) { res.end(JSON.stringify({ found: false })); return; }
-    // ★ ส่งรูป (base64 ก้อนใหญ่) ให้แค่ "ครั้งแรก" ที่ poll มาเจอ job นี้ เท่านั้น — หลังจากนั้นถือว่าส่งไปแล้ว
-    // (WS เป็นช่องทางหลักที่ push รูปให้อยู่แล้ว polling นี้เป็นแค่ fallback เผื่อ WS หลุด)
-    // ไม่งั้นทุก 3 วิที่ poll ซ้ำ จะโดนส่งรูปเดิมซ้ำไปเรื่อยๆ จนกว่า job จะถูกแทนที่ — กิน bandwidth ฟรีๆ
-    const includeImage = !!latest.recipientImage && !latest.imageDeliveredViaPoll;
-    if (includeImage) latest.imageDeliveredViaPoll = true;
+    // One tab polling must not consume the image for every other tab.
+    // Clients that already have this image may opt out using imageId.
+    const knownImageId = new URL(req.url, 'http://localhost').searchParams.get('imageId');
+    const includeImage = !!latest.recipientImage && knownImageId !== latest.id;
     res.end(JSON.stringify({
       found: true,
       id: latest.id,
@@ -311,12 +308,12 @@ wss.on('connection', (ws) => {
 
   ws.on('close', () => {
     if (name) {
-      clients.delete(name);
+      if (clients.get(name) === ws) clients.delete(name);
       console.log(`[WS] disconnected: ${name} (total: ${clients.size})`);
     }
   });
 
-  ws.on('error', () => { if (name) clients.delete(name); });
+  ws.on('error', () => { if (name && clients.get(name) === ws) clients.delete(name); });
 });
 
 // ===== Cleanup jobs เก่าตกค้าง (เผื่อ scheduleExpiry ไม่ทำงานเพราะ server รีสตาร์ท) ทุก 5 นาที =====
