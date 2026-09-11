@@ -123,7 +123,7 @@ const server = http.createServer((req, res) => {
           job.recipientBank = recipientBank || job.recipientBank || null;
           if (recipientImage) job.recipientImage = recipientImage; // ★ อัปเดตรูปเฉพาะเมื่อมีค่าใหม่ ไม่ทับด้วย null
           job.message = message || null;
-          job.doneAt = Date.now();
+          job.doneAt = job.doneAt || Date.now();
           console.log(`[Done] ${id} → ${status} | ${recipientName || ''}${recipientImage ? ' [+รูป]' : ''}`);
 
           // ★ ส่งผลกลับไปหา "ผู้ส่ง" (sentBy) แบบ real-time ผ่าน WS
@@ -139,7 +139,8 @@ const server = http.createServer((req, res) => {
               recipientBank: job.recipientBank,
               recipientImage: job.recipientImage || null,
               target: job.target,
-              ts: Date.now()
+              message: job.message,
+              ts: job.doneAt
             });
           }
 
@@ -162,9 +163,10 @@ const server = http.createServer((req, res) => {
   const resultMatch = url.match(/^\/api\/result\/(.+)$/);
   if (req.method === 'GET' && resultMatch) {
     const name = decodeURIComponent(resultMatch[1]);
+    const requestedJobId = new URL(req.url, 'http://localhost').searchParams.get('jobId');
     let latest = null;
     for (const job of jobs.values()) {
-      if (job.sentBy !== name) continue;
+      if (job.sentBy !== name || (requestedJobId && job.id !== requestedJobId)) continue;
       if (job.status !== 'done' && job.status !== 'error') continue;
       if (!latest || (job.doneAt || 0) > (latest.doneAt || 0)) latest = job;
     }
@@ -298,7 +300,7 @@ wss.on('connection', (ws) => {
           ws.send(JSON.stringify({
             type: 'result', id: j.id, status: j.status, accountNo: j.accountNo,
             bankName: j.bankName, recipientName: j.recipientName || null, recipientBank: j.recipientBank || null,
-            recipientImage: j.recipientImage || null, message: j.message || null, target: j.target, ts: Date.now()
+            recipientImage: j.recipientImage || null, message: j.message || null, target: j.target, ts: j.doneAt || j.createdAt
           }));
         });
         return;
