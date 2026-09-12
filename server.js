@@ -39,6 +39,8 @@ function scheduleExpiry(job) {
     if (!current) return; // ถูกจัดการ/ลบไปแล้ว (เช่น done ปกติ)
     if (current.status !== 'done' && current.status !== 'error') {
       current.status = 'error';
+      current.phase = 'error';
+      current.doneAt = Date.now();
       current.message = 'หมดเวลารอผลจาก KBiz (job expired)';
       console.log(`[Expire] ${current.id} → expired (สถานะก่อนหน้า: ${job.status})`);
       if (current.sentBy) {
@@ -57,7 +59,8 @@ function scheduleExpiry(job) {
         });
       }
     }
-    jobs.delete(job.id);
+    if (current.phase === 'error') setTimeout(() => jobs.delete(job.id),300000);
+    else jobs.delete(job.id);
   }, JOB_MAX_AGE);
 }
 
@@ -110,7 +113,7 @@ const server = http.createServer((req, res) => {
     req.on('data', d => body += d);
     req.on('end', () => {
       try {
-        const { status, message, recipientName, recipientBank, recipientImage } = JSON.parse(body || '{}');
+        const { status, message, recipientName, recipientBank, recipientImage, phase } = JSON.parse(body || '{}');
         const job = jobs.get(id);
         if (!job) {
           res.writeHead(404, { 'Content-Type': 'application/json' });
@@ -118,12 +121,19 @@ const server = http.createServer((req, res) => {
           return;
         }
         if (job) {
-          job.status = status || 'done';
+          const nextStatus = status || 'done';
+          if ((job.status === 'done' || job.status === 'error') && nextStatus === 'processing') {
+            res.writeHead(200, { 'Content-Type':'application/json' });
+            res.end(JSON.stringify({ok:true})); return;
+          }
+          job.status = nextStatus;
+          job.phase = nextStatus === 'error' ? 'error' : (recipientImage || job.recipientImage) ? 'complete' : nextStatus === 'processing' ? 'checking' : phase === 'image_failed' ? 'image_failed' : 'waiting_image';
+          job.updatedAt = Date.now();
           job.recipientName = recipientName || job.recipientName || null;
           job.recipientBank = recipientBank || job.recipientBank || null;
           if (recipientImage) job.recipientImage = recipientImage; // ★ อัปเดตรูปเฉพาะเมื่อมีค่าใหม่ ไม่ทับด้วย null
           job.message = message || null;
-          job.doneAt = job.doneAt || Date.now();
+          if (job.status === 'done' || job.status === 'error') job.doneAt = job.doneAt || Date.now();
           console.log(`[Done] ${id} → ${status} | ${recipientName || ''}${recipientImage ? ' [+รูป]' : ''}`);
 
           // ★ ส่งผลกลับไปหา "ผู้ส่ง" (sentBy) แบบ real-time ผ่าน WS
@@ -133,6 +143,7 @@ const server = http.createServer((req, res) => {
               type: 'result',
               id,
               status: job.status,
+              phase: job.phase,
               accountNo: job.accountNo,
               bankName: job.bankName,
               recipientName: job.recipientName,
@@ -140,7 +151,7 @@ const server = http.createServer((req, res) => {
               recipientImage: job.recipientImage || null,
               target: job.target,
               message: job.message,
-              ts: job.doneAt
+              ts: job.doneAt || job.updatedAt
             });
           }
 
@@ -148,7 +159,7 @@ const server = http.createServer((req, res) => {
           // Background tabs may be throttled and poll later than 15 seconds.
 
           // ลบทั้ง job หลัง 5 นาที (job เสร็จแล้ว ไม่ต้องรอ scheduleExpiry อีก)
-          setTimeout(() => jobs.delete(id), 300000);
+          if (job.status === 'done' || job.status === 'error') setTimeout(() => jobs.delete(id), 300000);
         }
         res.writeHead(200, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ ok: true }));
@@ -167,7 +178,7 @@ const server = http.createServer((req, res) => {
     let latest = null;
     for (const job of jobs.values()) {
       if (job.sentBy !== name || (requestedJobId && job.id !== requestedJobId)) continue;
-      if (job.status !== 'done' && job.status !== 'error') continue;
+      if (!requestedJobId && job.status !== 'done' && job.status !== 'error') continue;
       if (!latest || (job.doneAt || 0) > (latest.doneAt || 0)) latest = job;
     }
     res.writeHead(200, { 'Content-Type': 'application/json' });
@@ -180,13 +191,14 @@ const server = http.createServer((req, res) => {
       found: true,
       id: latest.id,
       status: latest.status,
+      phase: latest.phase || (latest.status === 'processing' ? 'checking' : 'queued'),
       accountNo: latest.accountNo,
       bankName: latest.bankName,
       recipientName: latest.recipientName || null,
       recipientBank: latest.recipientBank || null,
       recipientImage: includeImage ? latest.recipientImage : null,
       message: latest.message || null,
-      ts: latest.doneAt || Date.now()
+      ts: latest.doneAt || latest.updatedAt || latest.createdAt
     }));
     return;
   }
@@ -298,7 +310,7 @@ wss.on('connection', (ws) => {
         const doneForMe = [...jobs.values()].filter(j => j.sentBy === name && (j.status === 'done' || j.status === 'error'));
         doneForMe.forEach(j => {
           ws.send(JSON.stringify({
-            type: 'result', id: j.id, status: j.status, accountNo: j.accountNo,
+            type: 'result', id: j.id, status: j.status, phase: j.phase, accountNo: j.accountNo,
             bankName: j.bankName, recipientName: j.recipientName || null, recipientBank: j.recipientBank || null,
             recipientImage: j.recipientImage || null, message: j.message || null, target: j.target, ts: j.doneAt || j.createdAt
           }));
