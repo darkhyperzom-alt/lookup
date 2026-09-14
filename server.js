@@ -1,4 +1,4 @@
-// ===== savebank-server — server.js (v2.1: broadcast results back to sender + no-silent-expiry) =====
+// ===== savebank-server — server.js (v2.2: broadcast results back to sender + no-silent-expiry + hardening) =====
 // รองรับทั้ง:
 //   KBiz AutoFill v11        → /api/send, /api/poll/:name, /api/done/:id, /api/status
 //   KBiz BankLookup (BO)     → /api/send, /api/status, WS register (รับผลกลับ real-time)
@@ -23,6 +23,40 @@ const kbizResults = new Map();
 // เผื่อคิวยาว/KBiz ช้า และเมื่อหมดเวลาจะ "แจ้งเตือนผู้ส่งก่อนลบ" แทนที่จะลบเงียบๆ
 const JOB_MAX_AGE = 900000; // 15 นาที
 
+const MAX_BODY_BYTES = 5 * 1024 * 1024; // 5MB — กัน request ก้อนใหญ่/ไม่จบทำ memory หมด
+const MAX_PENDING_JOBS = 500; // กันโดนยิง /api/send รัวๆ จน jobs Map โตไม่จำกัด
+const ALLOWED_DONE_STATUS = ['processing', 'done', 'error'];
+
+function isValidStr(v, maxLen) { return typeof v === 'string' && v.length > 0 && v.length <= maxLen; }
+function isOptionalStr(v, maxLen) { return v === undefined || v === null || v === '' || isValidStr(v, maxLen); }
+
+// อ่าน request body พร้อมจำกัดขนาด กัน memory หมดจาก body ก้อนใหญ่/ไม่จบ
+// เรียก onBody(body) เมื่ออ่านจบปกติ — ถ้าเกินขนาดหรือ stream error จะตอบ response เองแล้ว ไม่เรียก onBody
+function readBody(req, res, onBody) {
+  const chunks = [];
+  let total = 0;
+  let tooLarge = false;
+  req.on('data', (d) => {
+    if (tooLarge) return;
+    total += d.length;
+    if (total > MAX_BODY_BYTES) {
+      tooLarge = true;
+      res.writeHead(413, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ ok: false, success: false, error: 'Request body too large' }));
+      req.destroy();
+      return;
+    }
+    chunks.push(d);
+  });
+  req.on('error', () => {
+    if (!res.headersSent) { try { res.writeHead(400); res.end(); } catch (e) {} }
+  });
+  req.on('end', () => {
+    if (tooLarge) return;
+    onBody(Buffer.concat(chunks).toString('utf8'));
+  });
+}
+
 function sendWS(name, payload) {
   const ws = clients.get(name);
   if (ws && ws.readyState === 1) {
@@ -32,9 +66,17 @@ function sendWS(name, payload) {
   return false;
 }
 
+// ตั้ง/เลื่อนเวลาลบ job ออกจาก Map — ยกเลิก timer ลบตัวเก่าก่อนเสมอ กัน timer ซ้อนกันหลายตัวแข่งกันลบ
+// job ก่อนเวลาที่ควรจะเป็น (เช่น ได้ชื่อก่อน ได้รูปทีหลัง คนละรอบ POST /api/done)
+function scheduleJobDeletion(job, delayMs) {
+  clearTimeout(job._deleteTimer);
+  job._deleteTimer = setTimeout(() => jobs.delete(job.id), delayMs);
+}
+
 // ★ ถ้า job หมดเวลาโดยยังไม่ done/error ให้แจ้งผู้ส่งก่อนลบ ไม่ให้ผลลัพธ์หายเงียบ
+// เก็บ timer handle ไว้ที่ job._expiryTimer — /api/done จะยกเลิกทันทีที่ job เสร็จจริง กันชนกับ timer นี้ตอน 15 นาทีพอดี
 function scheduleExpiry(job) {
-  setTimeout(() => {
+  job._expiryTimer = setTimeout(() => {
     const current = jobs.get(job.id);
     if (!current) return; // ถูกจัดการ/ลบไปแล้ว (เช่น done ปกติ)
     if (current.status !== 'done' && current.status !== 'error') {
@@ -58,9 +100,9 @@ function scheduleExpiry(job) {
           ts: Date.now()
         });
       }
+      scheduleJobDeletion(current, 300000);
     }
-    if (current.phase === 'error') setTimeout(() => jobs.delete(job.id),300000);
-    else jobs.delete(job.id);
+    // ถ้า done/error อยู่แล้วก่อนหน้านี้ /api/done เป็นคนตั้งเวลาลบให้แล้ว ไม่ต้องยุ่งซ้ำ
   }, JOB_MAX_AGE);
 }
 
@@ -109,11 +151,25 @@ const server = http.createServer((req, res) => {
   const doneMatch = url.match(/^\/api\/done\/(.+)$/);
   if (req.method === 'POST' && doneMatch) {
     const id = doneMatch[1];
-    let body = '';
-    req.on('data', d => body += d);
-    req.on('end', () => {
+    readBody(req, res, (body) => {
       try {
-        const { status, message, recipientName, recipientBank, recipientImage, phase } = JSON.parse(body || '{}');
+        if (!body || !body.trim()) {
+          res.writeHead(400, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, error: 'Empty request body' }));
+          return;
+        }
+        const { status, message, recipientName, recipientBank, recipientImage, phase } = JSON.parse(body);
+        if (status !== undefined && !ALLOWED_DONE_STATUS.includes(status)) {
+          res.writeHead(400, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, error: 'Invalid status value' }));
+          return;
+        }
+        if (!isOptionalStr(recipientName, 300) || !isOptionalStr(recipientBank, 300) ||
+            !isOptionalStr(message, 500) || (recipientImage !== undefined && recipientImage !== null && typeof recipientImage !== 'string')) {
+          res.writeHead(400, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, error: 'Invalid field types' }));
+          return;
+        }
         const job = jobs.get(id);
         if (!job) {
           res.writeHead(404, { 'Content-Type': 'application/json' });
@@ -126,20 +182,36 @@ const server = http.createServer((req, res) => {
             res.writeHead(200, { 'Content-Type':'application/json' });
             res.end(JSON.stringify({ok:true})); return;
           }
+          // ★ กัน error ที่มาช้า/มาซ้ำ (retry ฝั่ง KBiz AutoFill) ไปทับ job ที่ done แล้วและมีชื่อ/รูปจริงอยู่แล้ว
+          // ยอมรับเฉพาะ error ที่พก recipientName/recipientImage ใหม่มาด้วยจริงๆ (แก้ไขผลเดิม ไม่ใช่แค่รายงานพลาดซ้ำ)
+          const alreadyHasResult = job.status === 'done' && (job.recipientName || job.recipientImage);
+          const incomingHasResult = !!(recipientName || recipientImage);
+          if (alreadyHasResult && nextStatus === 'error' && !incomingHasResult) {
+            res.writeHead(200, { 'Content-Type':'application/json' });
+            res.end(JSON.stringify({ok:true})); return;
+          }
+          // ★ กัน 'done' ที่ retry ซ้ำ (ไม่มีอะไรใหม่ เช่น KBiz AutoFill ไม่เห็น response ครั้งแรกแล้วยิงซ้ำ)
+          // ไปส่ง WS ซ้ำ/ตั้ง timer ลบซ้ำโดยไม่จำเป็น
+          if (job.status === 'done' && nextStatus === 'done' && !recipientImage &&
+              (recipientName || null) === job.recipientName) {
+            res.writeHead(200, { 'Content-Type':'application/json' });
+            res.end(JSON.stringify({ok:true})); return;
+          }
           job.status = nextStatus;
+          if (job.status === 'done' || job.status === 'error') clearTimeout(job._expiryTimer);
           job.phase = nextStatus === 'error' ? 'error' : (recipientImage || job.recipientImage) ? 'complete' : nextStatus === 'processing' ? 'checking' : phase === 'image_failed' ? 'image_failed' : 'waiting_image';
           job.updatedAt = Date.now();
           job.recipientName = recipientName || job.recipientName || null;
           job.recipientBank = recipientBank || job.recipientBank || null;
           if (recipientImage) job.recipientImage = recipientImage; // ★ อัปเดตรูปเฉพาะเมื่อมีค่าใหม่ ไม่ทับด้วย null
           job.message = message || null;
-          if (job.status === 'done' || job.status === 'error') job.doneAt = job.doneAt || Date.now();
+          if (job.status === 'done' || job.status === 'error') job.doneAt = Date.now(); // ★ รีเฟรชทุกครั้งที่ถึง terminal state ไม่ใช่แค่ครั้งแรก
           console.log(`[Done] ${id} → ${status} | ${recipientName || ''}${recipientImage ? ' [+รูป]' : ''}`);
 
           // ★ ส่งผลกลับไปหา "ผู้ส่ง" (sentBy) แบบ real-time ผ่าน WS
           // ฝั่ง BO (KBiz BankLookup) ต้อง register ด้วยชื่อเดียวกับ "myName" ที่ใช้ส่ง (sentBy)
           if (job.sentBy) {
-            sendWS(job.sentBy, {
+            const pushed = sendWS(job.sentBy, {
               type: 'result',
               id,
               status: job.status,
@@ -153,13 +225,16 @@ const server = http.createServer((req, res) => {
               message: job.message,
               ts: job.doneAt || job.updatedAt
             });
+            // ★ กัน register-replay ส่งผลเดิมซ้ำทุกครั้งที่ reconnect — ถ้าส่งไม่ถึงตอนนี้ (client offline)
+            // ปล่อยให้กลไก replay ตอน register ช่วยส่งให้ทีหลังตามเดิม (ไม่ mark delivered)
+            if (pushed) job.delivered = true;
           }
 
           // Keep the image with the result until normal job cleanup (5 minutes).
           // Background tabs may be throttled and poll later than 15 seconds.
 
           // ลบทั้ง job หลัง 5 นาที (job เสร็จแล้ว ไม่ต้องรอ scheduleExpiry อีก)
-          if (job.status === 'done' || job.status === 'error') setTimeout(() => jobs.delete(id), 300000);
+          if (job.status === 'done' || job.status === 'error') scheduleJobDeletion(job, 300000);
         }
         res.writeHead(200, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ ok: true }));
@@ -205,14 +280,19 @@ const server = http.createServer((req, res) => {
 
   // ─── POST /api/send  (BO ส่งงานมา) ──────────────────
   if (req.method === 'POST' && url === '/api/send') {
-    let body = '';
-    req.on('data', d => body += d);
-    req.on('end', () => {
+    readBody(req, res, (body) => {
       try {
         const { target, accountNo, bankName, sentBy, username } = JSON.parse(body);
-        if (!target || !accountNo || !bankName) {
+        if (!isValidStr(target, 200) || !isValidStr(accountNo, 100) || !isValidStr(bankName, 200) ||
+            !isOptionalStr(sentBy, 200) || !isOptionalStr(username, 200)) {
           res.writeHead(400, { 'Content-Type': 'application/json' });
-          res.end(JSON.stringify({ success: false, error: 'Missing fields' }));
+          res.end(JSON.stringify({ success: false, error: 'Missing or invalid fields' }));
+          return;
+        }
+
+        if (jobs.size >= MAX_PENDING_JOBS) {
+          res.writeHead(429, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ success: false, error: 'Server is busy, too many pending jobs — try again shortly' }));
           return;
         }
 
@@ -241,9 +321,7 @@ const server = http.createServer((req, res) => {
 
   // ─── POST /api/kbiz-result  (legacy, เก็บไว้เผื่อใช้) ────────
   if (req.method === 'POST' && url === '/api/kbiz-result') {
-    let body = '';
-    req.on('data', d => body += d);
-    req.on('end', () => {
+    readBody(req, res, (body) => {
       try {
         const { sentBy, accountNo, bankName, holderName } = JSON.parse(body);
         if (!holderName || !accountNo) {
@@ -264,9 +342,11 @@ const server = http.createServer((req, res) => {
   if (req.method === 'GET' && url === '/api/kbiz-result') {
     const now = Date.now();
     let latest = null;
-    for (const [, r] of kbizResults) {
+    for (const [k, r] of kbizResults) {
       if (now - r.ts < 30000) {
         if (!latest || r.ts > latest.ts) latest = r;
+      } else {
+        kbizResults.delete(k); // ★ ล้าง entry เก่าทิ้งระหว่างสแกน กัน Map โตไม่จำกัด (endpoint นี้ไม่มี consumer ล้างให้เอง)
       }
     }
     res.writeHead(200, { 'Content-Type': 'application/json' });
@@ -292,32 +372,47 @@ wss.on('connection', (ws) => {
         return;
       }
 
-      if (msg.type === 'register' && msg.name) {
+      if (msg.type === 'register') {
+        if (!msg.name) {
+          console.log('[WS] register received with missing/empty name — ignored');
+          ws.send(JSON.stringify({ type: 'error', reason: 'register requires a non-empty name' }));
+          return;
+        }
+        // ★ กัน entry เก่าค้างถ้า socket เดียวกัน register ชื่อใหม่ทับชื่อเดิม
+        if (name && clients.get(name) === ws) clients.delete(name);
         name = msg.name;
         clients.set(name, ws);
         console.log(`[WS] registered: ${name} (total: ${clients.size})`);
         ws.send(JSON.stringify({ type: 'registered', name }));
 
-        // ส่ง pending jobs ที่มีอยู่แล้วทันที (กรณีนี้คือชื่อนี้เป็น "target"/ฝั่ง KBiz)
-        const pending = [...jobs.values()].filter(j => j.target === name && j.status === 'pending');
+        // ส่ง job ที่ยังไม่เสร็จกลับไปให้ทันที (กรณีนี้คือชื่อนี้เป็น "target"/ฝั่ง KBiz)
+        // ★ เดิมกรองแค่ 'pending' ทำให้ job ที่ push ผ่าน WS ไปแล้ว (sent-ws/processing) แต่ client
+        // หลุดการเชื่อมต่อก่อนตอบ done หายไปเงียบๆ จนกว่าจะ timeout 15 นาที — ตอนนี้ replay ทุกสถานะที่ยังไม่จบให้
+        const pending = [...jobs.values()].filter(j => j.target === name && ['pending', 'sent-ws', 'processing'].includes(j.status));
         pending.forEach(j => {
           ws.send(JSON.stringify({ type: 'job', id: j.id, accountNo: j.accountNo, bankName: j.bankName, sentBy: j.sentBy, username: j.username || '' }));
           ws.send(JSON.stringify({ type: 'search', id: j.id, accountNo: j.accountNo, bankName: j.bankName, sentBy: j.sentBy, username: j.username || '' }));
           j.status = 'sent-ws';
         });
 
-        // ถ้าชื่อนี้เป็น "sentBy" ของงานที่เพิ่ง done แล้วยังไม่ถูกส่งกลับ (เผื่อ reconnect พลาดจังหวะ)
-        const doneForMe = [...jobs.values()].filter(j => j.sentBy === name && (j.status === 'done' || j.status === 'error'));
+        // ถ้าชื่อนี้เป็น "sentBy" ของงานที่ done แล้วแต่ยังไม่เคยถูกส่งกลับสำเร็จ (เผื่อ reconnect พลาดจังหวะ)
+        // ★ เช็ค !delivered กัน resend ผลเดิมซ้ำทุกครั้งที่ reconnect ภายในช่วงที่ job ยังไม่ถูกลบ
+        const doneForMe = [...jobs.values()].filter(j => j.sentBy === name && (j.status === 'done' || j.status === 'error') && !j.delivered);
         doneForMe.forEach(j => {
           ws.send(JSON.stringify({
             type: 'result', id: j.id, status: j.status, phase: j.phase, accountNo: j.accountNo,
             bankName: j.bankName, recipientName: j.recipientName || null, recipientBank: j.recipientBank || null,
             recipientImage: j.recipientImage || null, message: j.message || null, target: j.target, ts: j.doneAt || j.createdAt
           }));
+          j.delivered = true;
         });
         return;
       }
-    } catch(e) {}
+
+      console.log(`[WS] unrecognized message type: ${msg.type}`);
+    } catch(e) {
+      console.log('[WS] failed to parse message:', e.message);
+    }
   });
 
   ws.on('close', () => {
@@ -330,14 +425,17 @@ wss.on('connection', (ws) => {
   ws.on('error', () => { if (name && clients.get(name) === ws) clients.delete(name); });
 });
 
-// ===== Cleanup jobs เก่าตกค้าง (เผื่อ scheduleExpiry ไม่ทำงานเพราะ server รีสตาร์ท) ทุก 5 นาที =====
+// ===== Cleanup jobs/ผลลัพธ์เก่าตกค้าง (เผื่อ timer ปกติไม่ทำงานเพราะ server รีสตาร์ท) ทุก 5 นาที =====
 setInterval(() => {
   const now = Date.now();
   for (const [id, job] of jobs) {
     if (now - job.createdAt > JOB_MAX_AGE + 300000) { jobs.delete(id); }
   }
+  for (const [k, r] of kbizResults) {
+    if (now - r.ts >= 30000) kbizResults.delete(k); // ★ legacy endpoint ไม่มี consumer คอยล้างให้เสมอไป ต้องกวาดเองเป็นระยะ
+  }
 }, 300000);
 
 server.listen(PORT, () => {
-  console.log(`✅ savebank-server (v2.1 — realtime result relay + no-silent-expiry) running on port ${PORT}`);
+  console.log(`✅ savebank-server (v2.2 — realtime result relay + no-silent-expiry + hardening) running on port ${PORT}`);
 });
